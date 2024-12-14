@@ -143,6 +143,7 @@ class ActivationStoreConfig(BaseModelConfig, RunnerConfig):
     use_cached_activations: bool = False
     cached_activations_path: List[str] = None  # type: ignore
     shuffle_activations: bool = True
+    preload_queue_maxsize: int = 32
 
     n_tokens_in_buffer: int = 500_000
     tp_size: int = 1

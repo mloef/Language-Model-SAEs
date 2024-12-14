@@ -321,9 +321,9 @@ class CrossCoder(SparseAutoEncoder):
         }
 
         # l_l1: (batch,)
-        feature_acts = feature_acts * self.decoder_norm(local_only=False, aggregate='mean')
-
+        
         if not self.cfg.act_fn == "topk":
+            feature_acts = feature_acts * self.decoder_norm(local_only=False, aggregate='mean')
             l_l1 = torch.norm(feature_acts, p=self.cfg.lp, dim=-1)
             loss_dict["l_l1"] = l_l1
             loss = loss + self.current_l1_coefficient * l_l1.mean()

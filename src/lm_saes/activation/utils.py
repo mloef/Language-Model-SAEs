@@ -18,5 +18,5 @@ def list_activation_chunks(activation_path: str, hook_point: str) -> list[str]:
 
 
 @torch.no_grad()
-def load_activation_chunk(chunk_path: str) -> Dict[str, torch.Tensor]:
-    return torch.load(chunk_path, weights_only=True)
+def load_activation_chunk(chunk_path: str, map_location: str | torch.device=None) -> Dict[str, torch.Tensor]:
+    return torch.load(chunk_path, weights_only=True, map_location=map_location)

@@ -6,6 +6,8 @@ import torch
 import torch.distributed as dist
 from einops import rearrange, repeat
 from transformer_lens import HookedTransformer
+from threading import Thread
+import queue
 
 from .utils import list_activation_chunks, load_activation_chunk
 from .token_source import TokenSource
@@ -85,15 +87,32 @@ class CachedActivationSource(ActivationSource):
             ]
         if cfg.shuffle_activations:
             random.shuffle(self.chunk_paths)
+        
+        self.chunk_queue = queue.Queue(maxsize=self.cfg.preload_queue_maxsize)  # Buffer for preloaded chunks
+        self.stop_preloader = False
+        self.preloader = Thread(target=self._preload_chunks, daemon=True)
+        self.preloader.start()
 
         self.token_buffer = torch.empty((0, cfg.dataset.context_size), dtype=torch.long, device=cfg.device)
+    
+    def _preload_chunks(self):
+        while not self.stop_preloader and len(self.chunk_paths) > 0:
+            if not self.chunk_queue.full():
+                chunk_path = self.chunk_paths.pop()
+                chunk = load_activation_chunk(chunk_path, map_location='cpu')
+                self.chunk_queue.put(chunk)
 
     def _load_next_chunk(self):
-        if len(self.chunk_paths) == 0:
+        # chunk_path = self.chunk_paths.pop()
+        # chunk = load_activation_chunk(chunk_path, map_location=self.cfg.device)
+        # return chunk
+        if self.chunk_queue.empty() and len(self.chunk_paths) == 0:
             return None
-        chunk_path = self.chunk_paths.pop()
-        chunk = load_activation_chunk(chunk_path)
-        return chunk
+        return self.chunk_queue.get()
+    
+    def __del__(self):
+        self.stop_preloader = True
+        self.preloader.join()
 
     def next(self) -> Dict[str, torch.Tensor] | None:
         chunk = self._load_next_chunk()
@@ -102,7 +121,7 @@ class CachedActivationSource(ActivationSource):
         assert len(chunk["activation"].size()) in [2, 3], f'activation size must be 2-dim (no context) or 3-dim (with context stored in batches)'
         with_context = len(chunk["activation"].size()) == 3
 
-        activations = chunk["activation"].to(dtype=self.cfg.dtype, device=self.cfg.device)
+        activations = chunk["activation"].to(dtype=self.cfg.dtype, device=self.cfg.device, non_blocking=True)
 
         ret = {self.hook_point: rearrange(activations, "b l d -> (b l) d") if with_context else activations}
         if with_context:

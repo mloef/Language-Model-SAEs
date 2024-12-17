@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 from transformer_lens import HookedTransformer
+from concurrent.futures import ThreadPoolExecutor
 
 from ..config import ActivationGenerationConfig
 from ..utils.misc import is_master, print_once
@@ -65,6 +66,41 @@ def generate_shuffled_activation(model: HookedTransformer, cfg: ActivationGenera
     assert activations is not None, "Out of activations"
 
     return activations, cfg.generate_batch_size
+
+
+def save_activation(hook_point, act_dict, cfg, context, chunk_idx):
+    """Save the activation for a single hook_point."""
+    result = {"activation": act_dict[hook_point].to('cpu', non_blocking=True)}
+    if cfg.generate_with_context:
+        assert context is not None, "Context is not initialized"
+        result["context"] = context.to('cpu', non_blocking=True)
+    
+    # Determine the filename
+    filename = (
+        f"chunk-{str(chunk_idx).zfill(5)}.pt"
+        if not dist.is_initialized()
+        else f"shard-{dist.get_rank()}-chunk-{str(chunk_idx).zfill(5)}.pt"
+    )
+    
+    save_path = os.path.join(cfg.activation_save_path, hook_point, filename)
+    
+    # Save the result
+    torch.save(result, save_path)
+
+def parallel_save(cfg, act_dict, context, chunk_idx, max_workers=8):
+    """Parallelize the saving of activations."""
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for hook_point in cfg.hook_points:
+            futures.append(
+                executor.submit(
+                    save_activation, hook_point, act_dict, cfg, context, chunk_idx
+                )
+            )
+        
+        # Optionally, wait for all tasks to complete
+        # for future in futures:
+        #     future.result()
 
 
 @torch.no_grad()
@@ -130,21 +166,28 @@ def make_activation_dataset(model: HookedTransformer, cfg: ActivationGenerationC
             for hook_point in cfg.hook_points:
                 act_dict[hook_point] -= act_dict[hook_point].mean(dim=non_activation_dims)
 
-        for hook_point in cfg.hook_points:
-            result = {"activation": act_dict[hook_point]}
-            if cfg.generate_with_context:
-                assert context is not None, "Context is not initialized"
-                result["context"] = context
-            torch.save(
-                result,
-                os.path.join(
-                    cfg.activation_save_path,
-                    hook_point,
-                    f"chunk-{str(chunk_idx).zfill(5)}.pt"
-                    if not dist.is_initialized()
-                    else f"shard-{dist.get_rank()}-chunk-{str(chunk_idx).zfill(5)}.pt",
-                ),
-            )
+        parallel_save(
+            cfg, 
+            act_dict, 
+            context, 
+            chunk_idx,
+            max_workers=32
+        )
+        # for hook_point in cfg.hook_points:
+        #     result = {"activation": act_dict[hook_point]}
+        #     if cfg.generate_with_context:
+        #         assert context is not None, "Context is not initialized"
+        #         result["context"] = context
+        #     torch.save(
+        #         result,
+        #         os.path.join(
+        #             cfg.activation_save_path,
+        #             hook_point,
+        #             f"chunk-{str(chunk_idx).zfill(5)}.pt"
+        #             if not dist.is_initialized()
+        #             else f"shard-{dist.get_rank()}-chunk-{str(chunk_idx).zfill(5)}.pt",
+        #         ),
+        #     )
         chunk_idx += 1
         torch.cuda.empty_cache()
 

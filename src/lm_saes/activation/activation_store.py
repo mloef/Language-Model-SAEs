@@ -45,14 +45,6 @@ class ActivationStore:
             self._store[k] = self._store[k][perm]
 
     def refill(self):
-        pbar = tqdm(
-            total=self.buffer_size,
-            desc="Refilling activation store",
-            smoothing=0,
-            leave=False,
-            initial=self.__len__(),
-        )
-        n_seqs = 0
         while self.__len__() < self.buffer_size:
             new_act = self.act_source.next()
             if new_act is None:
@@ -65,10 +57,6 @@ class ActivationStore:
                     self._store[k] = torch.cat([self._store[k], v], dim=0)
             # Check if all activations have the same size
             assert len(set(v.size(0) for v in self._store.values())) == 1
-            n_seqs += 1
-            pbar.update(next(iter(new_act.values())).size(0))
-            pbar.set_postfix({"Sequences": n_seqs})
-        pbar.close()
 
     def __len__(self):
         if len(self._store) == 0:

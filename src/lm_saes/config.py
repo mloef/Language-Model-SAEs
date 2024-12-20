@@ -179,6 +179,7 @@ class SAEConfig(BaseModelConfig):
     Configuration for training or running a sparse autoencoder.
     """
 
+    sae_type: str = 'sparse_autoencoder'
     hook_point_in: str = "blocks.0.hook_resid_pre"
     """ The hook point to use as input to the SAE. """
     hook_point_out: str = None  # type: ignore
@@ -222,6 +223,7 @@ class SAEConfig(BaseModelConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        assert self.sae_type in ['sparse_autoencoder', 'crosscoder']
         if self.hook_point_out is None:
             self.hook_point_out = self.hook_point_in
         if self.d_sae is None:
@@ -484,6 +486,7 @@ class LanguageModelSAEAnalysisConfig(RunnerConfig):
     sae: SAEConfig
     lm: LanguageModelConfig
     dataset: TextDatasetConfig
+    act_store: ActivationStoreConfig
     mongo: MongoConfig
 
     total_analyzing_tokens: int = 300_000_000

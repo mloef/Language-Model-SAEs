@@ -88,31 +88,31 @@ class CachedActivationSource(ActivationSource):
         if cfg.shuffle_activations:
             random.shuffle(self.chunk_paths)
         
-        self.chunk_queue = queue.Queue(maxsize=self.cfg.preload_queue_maxsize)  # Buffer for preloaded chunks
-        self.stop_preloader = False
-        self.preloader = Thread(target=self._preload_chunks, daemon=True)
-        self.preloader.start()
+        # self.chunk_queue = queue.Queue(maxsize=self.cfg.preload_queue_maxsize)  # Buffer for preloaded chunks
+        # self.stop_preloader = False
+        # self.preloader = Thread(target=self._preload_chunks, daemon=True)
+        # self.preloader.start()
 
         self.token_buffer = torch.empty((0, cfg.dataset.context_size), dtype=torch.long, device=cfg.device)
     
-    def _preload_chunks(self):
-        while not self.stop_preloader and len(self.chunk_paths) > 0:
-            if not self.chunk_queue.full():
-                chunk_path = self.chunk_paths.pop()
-                chunk = load_activation_chunk(chunk_path, map_location='cpu')
-                self.chunk_queue.put(chunk)
+    # def _preload_chunks(self):
+    #     while not self.stop_preloader and len(self.chunk_paths) > 0:
+    #         if not self.chunk_queue.full():
+    #             chunk_path = self.chunk_paths.pop()
+    #             chunk = load_activation_chunk(chunk_path, map_location='cpu')
+    #             self.chunk_queue.put(chunk)
 
     def _load_next_chunk(self):
-        # chunk_path = self.chunk_paths.pop()
-        # chunk = load_activation_chunk(chunk_path, map_location=self.cfg.device)
-        # return chunk
-        if self.chunk_queue.empty() and len(self.chunk_paths) == 0:
-            return None
-        return self.chunk_queue.get()
+        chunk_path = self.chunk_paths.pop()
+        chunk = load_activation_chunk(chunk_path, map_location=self.cfg.device)
+        return chunk
+        # if self.chunk_queue.empty() and len(self.chunk_paths) == 0:
+        #     return None
+        # return self.chunk_queue.get()
     
-    def __del__(self):
-        self.stop_preloader = True
-        self.preloader.join()
+    # def __del__(self):
+    #     self.stop_preloader = True
+    #     self.preloader.join()
 
     def next(self) -> Dict[str, torch.Tensor] | None:
         chunk = self._load_next_chunk()
@@ -130,13 +130,9 @@ class CachedActivationSource(ActivationSource):
         if with_context:
             ret.update(
                 {
-                    "position": rearrange(
-                        chunk["position"].to(dtype=torch.long, device=self.cfg.device), "b l -> (b l)"
-                    ),
-                    "context": repeat(
+                    "context": rearrange(
                         chunk["context"].to(dtype=torch.long, device=self.cfg.device),
-                        "b l -> (b repeat) l",
-                        repeat=activations.size(1),
+                        "b l -> (b l)",
                     ),
                 }
             )

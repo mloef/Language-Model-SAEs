@@ -5,6 +5,7 @@ from typing import cast
 import torch
 import wandb
 from datasets import Dataset, load_dataset, load_from_disk
+import torch.distributed as dist
 from torch.distributed.tensor import Replicate
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -19,6 +20,7 @@ from transformers import (
     ChameleonForConditionalGeneration,
     PreTrainedModel,
 )
+from concurrent.futures import ThreadPoolExecutor
 
 from .activation.activation_dataset import make_activation_dataset
 from .activation.activation_source import CachedActivationSource
@@ -34,6 +36,7 @@ from .config import (
     LanguageModelSAEPruningConfig,
     LanguageModelSAERunnerConfig,
     LanguageModelSAETrainingConfig,
+    SAEConfig,
 )
 from .crosscoder import CrossCoder
 from .database import MongoClient
@@ -91,6 +94,13 @@ def get_model(cfg: LanguageModelConfig):
     )
     model.eval()
     return model
+
+def get_sae_class(cfg: SAEConfig):
+    class_dict = {
+        'sparse_autoencoder': SparseAutoEncoder,
+        'crosscoder': CrossCoder,
+    }
+    return class_dict[cfg.sae_type]
 
 
 def language_model_sae_runner(cfg: LanguageModelSAETrainingConfig):
@@ -298,7 +308,8 @@ def activation_generation_runner(cfg: ActivationGenerationConfig):
 
 
 def sample_feature_activations_runner(cfg: LanguageModelSAEAnalysisConfig):
-    sae = SparseAutoEncoder.from_config(cfg=cfg.sae)
+    SaeClass = get_sae_class(cfg.sae)
+    sae = SaeClass.from_config(cfg=cfg.sae)
 
     if cfg.sae.tp_size > 1:
         plan = {
@@ -307,48 +318,101 @@ def sample_feature_activations_runner(cfg: LanguageModelSAEAnalysisConfig):
         }
         if cfg.sae.use_glu_encoder:
             plan["encoder_glu"] = ColwiseParallel(output_layouts=Replicate())
-        sae = cast(SparseAutoEncoder, parallelize_module(sae, device_mesh=sae.device_mesh["tp"], parallelize_plan=plan))
+        sae = cast(SaeClass, parallelize_module(sae, device_mesh=sae.device_mesh["tp"], parallelize_plan=plan))
 
     sae.decoder.weight = None  # type: ignore[assignment]
     torch.cuda.empty_cache()
 
-    model = get_model(cfg.lm)
+    if cfg.act_store.use_cached_activations:
+        activation_source = CachedActivationSource(cfg.act_store)
+        activation_store = ActivationStore(act_source=activation_source, cfg=cfg.act_store)
+        model = None
+        dataset = None
+        hf_tokenizer = AutoTokenizer.from_pretrained(
+            (cfg.lm.model_name if cfg.lm.model_from_pretrained_path is None else cfg.lm.model_from_pretrained_path),
+            trust_remote_code=True,
+            use_fast=True,
+            add_bos_token=True,
+            local_files_only=True,
+        )
+        ignore_tokens = {
+            hf_tokenizer.bos_token_id,
+            hf_tokenizer.eos_token_id,
+        }
+    else:
+        model = get_model(cfg.lm)
+        assert len(cfg.dataset.dataset_path) == 1, "Only one dataset path is supported"
+        if not cfg.dataset.is_dataset_on_disk:
+            dataset = load_dataset(
+                cfg.dataset.dataset_path[0], split="train", cache_dir=cfg.dataset.cache_dir, keep_in_memory=True
+            )
+        else:
+            dataset = load_from_disk(cfg.dataset.dataset_path[0], keep_in_memory=True)
+        dataset = cast(Dataset, dataset)
+        dataset = dataset.with_format("torch", device=cfg.lm.device)
+        activation_store = None
+        ignore_tokens = {
+            model.tokenizer.bos_token_id,
+            model.tokenizer.eos_token_id,
+            model.tokenizer.pad_token_id,
+        }
+
     client = MongoClient(cfg.mongo.mongo_uri, cfg.mongo.mongo_db)
     if is_master():
         client.create_dictionary(cfg.exp_name, cfg.exp_result_path, cfg.sae.d_sae, cfg.exp_series)
+    
+        
 
-    assert len(cfg.dataset.dataset_path) == 1, "Only one dataset path is supported"
-    if not cfg.dataset.is_dataset_on_disk:
-        dataset = load_dataset(
-            cfg.dataset.dataset_path[0], split="train", cache_dir=cfg.dataset.cache_dir, keep_in_memory=True
+    def write_to_db(cfg, client, result, i):
+        client.update_feature(
+            cfg.exp_name,
+            result["index"][i].item(),
+            {
+                "act_times": result["act_times"][i].item(),
+                "max_feature_acts": result["max_feature_acts"][i].item(),
+                "dataset": cfg.dataset.dataset_path,
+                "analysis": [
+                    {
+                        "name": v["name"],
+                        "feature_acts": v["feature_acts"][i].cpu().float().numpy(),
+                        "context_ids": v["context_ids"][i].cpu().numpy(),
+                    }
+                    for v in result["analysis"]
+                ],
+            },
+            dictionary_series=cfg.exp_series,
         )
-    else:
-        dataset = load_from_disk(cfg.dataset.dataset_path[0], keep_in_memory=True)
-    dataset = cast(Dataset, dataset)
-    dataset = dataset.with_format("torch", device=cfg.lm.device)
+    
+    def parallel_write(cfg, client, result, max_workers):
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for i in range(len(result["index"].cpu().numpy().tolist())):
+                futures.append(
+                    executor.submit(
+                        write_to_db, cfg, client, result, i
+                    )
+                )
+        
+            # Optionally, wait for all tasks to complete
+            for future in futures:
+                future.result()
+
 
     for chunk_id in range(cfg.n_sae_chunks):
-        result = sample_feature_activations(sae, model, dataset, cfg, chunk_id, cfg.n_sae_chunks)
-        for i in range(len(result["index"].cpu().numpy().tolist())):
-            client.update_feature(
-                cfg.exp_name,
-                result["index"][i].item(),
-                {
-                    "act_times": result["act_times"][i].item(),
-                    "max_feature_acts": result["max_feature_acts"][i].item(),
-                    "dataset": cfg.dataset.dataset_path,
-                    "analysis": [
-                        {
-                            "name": v["name"],
-                            "feature_acts": v["feature_acts"][i].cpu().float().numpy(),
-                            "context_ids": v["context_ids"][i].cpu().numpy(),
-                        }
-                        for v in result["analysis"]
-                    ],
-                },
-                dictionary_series=cfg.exp_series,
-            )
+        result = sample_feature_activations(
+            sae=sae, 
+            cfg=cfg, 
+            sae_chunk_id=chunk_id, 
+            n_sae_chunks=cfg.n_sae_chunks,
+            model=model, 
+            dataset=dataset,
+            activation_store=activation_store,
+            ignore_tokens=ignore_tokens
+        )
 
+        if is_master():
+            parallel_write(cfg, client, result, os.cpu_count())
+            
         del result
         torch.cuda.empty_cache()
 

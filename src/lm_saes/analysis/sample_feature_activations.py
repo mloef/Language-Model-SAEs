@@ -8,23 +8,72 @@ from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformer_lens import HookedTransformer
+from functools import partial
 
 from ..config import LanguageModelSAEAnalysisConfig
 from ..sae import SparseAutoEncoder
 from ..utils.misc import print_once
 from ..utils.tensor_dict import concat_dict_of_tensor, sort_dict_of_tensor
+from ..activation.activation_store import ActivationStore
+
+
+def _generator_on_the_fly(
+        cfg,
+        model, 
+        dataloader,
+    ):
+    for batch_idx, batch in enumerate(dataloader):
+        tokens, token_origins = zip(*[model.to_tokens_with_origins(input) for input in batch])
+        tokens = torch.cat(tokens, dim=0)
+
+        _, cache = model.run_with_cache_until(
+            tokens,
+            names_filter=[cfg.sae.hook_point_in, cfg.sae.hook_point_out],
+            until=cfg.sae.hook_point_out,
+        )
+        activation_in, _ = (
+            cache[cfg.sae.hook_point_in],
+            cache[cfg.sae.hook_point_out],
+        )
+
+        yield tokens, activation_in, len(batch)
+
+def _generator_with_cached_store(
+        cfg,
+        activation_store,
+    ):
+        while True:
+            num_tokens_per_batch = cfg.dataset.store_batch_size * cfg.dataset.context_size
+            batch = activation_store.next(batch_size=num_tokens_per_batch)
+            assert batch is not None, "Activation store is empty"
+            yield (
+                batch['context'].view(
+                    cfg.dataset.store_batch_size,
+                    cfg.dataset.context_size,
+                ), 
+                batch[cfg.act_store.hook_points[0]].view(
+                    cfg.dataset.store_batch_size, 
+                    cfg.dataset.context_size, 
+                    cfg.lm.d_model,
+                ), 
+                num_tokens_per_batch
+            )
 
 
 @torch.no_grad()
 def sample_feature_activations(
     sae: SparseAutoEncoder,
-    model: HookedTransformer,
-    dataset: Dataset,
     cfg: LanguageModelSAEAnalysisConfig,
     sae_chunk_id: int = 0,
     n_sae_chunks: int = 1,  # By default, we do not chunk the SAE. When the model & SAE is large, we can chunk the SAE to save memory.
+    model: HookedTransformer | None = None,
+    dataset: Dataset | None = None,
+    activation_store: ActivationStore | None = None,
+    ignore_tokens: set[int | None] = set(),
 ):
-    assert model.tokenizer is not None, "Tokenizer is not set"
+    generate_activations_on_the_fly = (model is not None) and (dataset is not None)
+    assert generate_activations_on_the_fly ^ (activation_store is not None), \
+        "Must provide either model & dataset or cached activation store"
 
     if sae.cfg.ddp_size > 1:
         raise ValueError("Sampling feature activations does not support DDP yet")
@@ -63,8 +112,8 @@ def sample_feature_activations(
                 dtype=cfg.sae.dtype,
                 device=cfg.sae.device,
             ),
-            "contexts": torch.empty(
-                (0, d_sae, cfg.dataset.context_size),
+            "context_ids": torch.empty(
+                (0, d_sae),
                 dtype=torch.int32,
                 device=cfg.sae.device,
             ),
@@ -74,32 +123,35 @@ def sample_feature_activations(
     act_times = torch.zeros((d_sae,), dtype=torch.long, device=cfg.sae.device)
     max_feature_acts = torch.zeros((d_sae,), dtype=cfg.sae.dtype, device=cfg.sae.device)
 
-    dataloader = DataLoader(
-        cast(torch.utils.data.Dataset[dict[str, Any]], dataset),
-        batch_size=cfg.dataset.store_batch_size,
-        shuffle=False,
-        collate_fn=lambda x: x,
-    )
-
-    for batch_idx, batch in enumerate(dataloader):
-        tokens, token_origins = zip(*[model.to_tokens_with_origins(input) for input in batch])
-        tokens = torch.cat(tokens, dim=0)
-
-        _, cache = model.run_with_cache_until(
-            tokens,
-            names_filter=[cfg.sae.hook_point_in, cfg.sae.hook_point_out],
-            until=cfg.sae.hook_point_out,
+    if generate_activations_on_the_fly:
+        dataloader = DataLoader(
+            cast(torch.utils.data.Dataset[dict[str, Any]], dataset),
+            batch_size=cfg.dataset.store_batch_size,
+            shuffle=False,
+            collate_fn=lambda x: x,
         )
-        activation_in, _ = (
-            cache[cfg.sae.hook_point_in],
-            cache[cfg.sae.hook_point_out],
+        
+        token_activation_generator = _generator_on_the_fly(
+            cfg=cfg,
+            model=model, 
+            dataloader=dataloader,
+        )
+    else:   
+        token_activation_generator = _generator_with_cached_store(
+            cfg=cfg,
+            activation_store=activation_store,
         )
 
-        filter_mask = torch.logical_or(
-            tokens == model.tokenizer.eos_token_id,
-            tokens == model.tokenizer.pad_token_id,
-        )
-        filter_mask = torch.logical_or(filter_mask, tokens == model.tokenizer.bos_token_id)
+    for batch_idx, batch in enumerate(token_activation_generator):
+        tokens, activation_in, num_tokens_per_batch = batch
+
+        if len(ignore_tokens) > 0:
+            filter_mask = torch.any(
+                torch.stack(
+                    [tokens == ignore_token for ignore_token in ignore_tokens], dim=0
+                ),
+                dim=0,
+            )
 
         feature_acts = sae.encode(activation_in)[..., start_index:end_index]
         if isinstance(feature_acts, DTensor):
@@ -135,7 +187,10 @@ def sample_feature_activations(
                         "batch_size context_size d_sae -> batch_size d_sae context_size",
                     ),
                     "context_ids": repeat(
-                        torch.arange(len(batch), device=cfg.sae.device) + batch_idx * cfg.dataset.store_batch_size,
+                        torch.arange(
+                            cfg.dataset.store_batch_size,
+                            device=cfg.sae.device
+                        ) + batch_idx * cfg.dataset.store_batch_size,
                         "batch_size -> batch_size d_sae",
                         d_sae=d_sae,
                     ),
@@ -148,11 +203,10 @@ def sample_feature_activations(
 
         max_feature_acts = torch.max(max_feature_acts, feature_acts.max(dim=0).values.max(dim=0).values)
 
-        n_tokens_current = torch.tensor(batch.size(0) * batch.size(1), device=cfg.sae.device, dtype=torch.int)
-        n_training_tokens += cast(int, n_tokens_current.item())
+        n_training_tokens += num_tokens_per_batch
         n_training_steps += 1
 
-        pbar.update(n_tokens_current.item())
+        pbar.update(num_tokens_per_batch)
 
         if n_training_tokens >= total_analyzing_tokens:
             break

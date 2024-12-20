@@ -1,5 +1,8 @@
 from typing import Dict, List, Literal, Union, overload
 
+import os
+from importlib.metadata import version
+import safetensors.torch as safe
 import torch
 from jaxtyping import Float
 from transformer_lens.hook_points import HookPoint
@@ -8,6 +11,7 @@ from .activation.activation_store import ActivationStore
 from .config import LanguageModelSAETrainingConfig, SAEConfig
 from .sae import SparseAutoEncoder
 from .utils.misc import all_gather_tensor, get_tensor_from_specific_rank, print_once
+from .utils.huggingface import parse_pretrained_name_or_path
 
 
 class CrossCoder(SparseAutoEncoder):
@@ -379,3 +383,81 @@ class CrossCoder(SparseAutoEncoder):
         self.set_decoder_norm_to_fixed_norm(best_norm_fine_grained, force_exact=True)
 
         return self
+
+    def save_pretrained(self, ckpt_path: str) -> None:
+        """Save the model to the checkpoint path.
+
+        Args:
+            ckpt_path (str): The path to save the model. If a directory, the model will be saved to the directory with the default filename `sae_weights.safetensors`.
+        """
+        if os.path.isdir(ckpt_path):
+            ckpt_path = os.path.join(ckpt_path, "sae_weights.safetensors")
+        state_dict = self.get_full_state_dict()
+
+        # overloaded to save on all processes
+
+        if ckpt_path.endswith(".safetensors"):
+            safe.save_file(state_dict, ckpt_path, {"version": version("lm-saes")})
+        elif ckpt_path.endswith(".pt"):
+            torch.save({"sae": state_dict, "version": version("lm-saes")}, ckpt_path)
+        else:
+            raise ValueError(
+                f"Invalid checkpoint path {ckpt_path}. Currently only supports .safetensors and .pt formats."
+            )
+    
+    @classmethod
+    def from_config(cls, cfg: SAEConfig) -> "CrossCoder":
+        """Load the CrossCoder model from the pretrained configuration.
+
+        Args:
+            cfg (SAEConfig): The configuration of the model, containing the sae_pretrained_name_or_path.
+
+        Returns:
+            CrossCoder: The pretrained CrossCoder model.
+        """
+        pretrained_name_or_path = cfg.sae_pretrained_name_or_path
+        if pretrained_name_or_path is None:
+            return cls(cfg)
+
+        path = parse_pretrained_name_or_path(pretrained_name_or_path)
+
+        if path.endswith(".pt") or path.endswith(".safetensors"):
+            ckpt_path = path
+        else:
+            ckpt_prioritized_paths = [
+                f"{path}/sae_weights.safetensors",
+                f"{path}/sae_weights.pt",
+                f"{path}/checkpoints/pruned.safetensors",
+                f"{path}/checkpoints/pruned.pt",
+                f"{path}/checkpoints/final.safetensors",
+                f"{path}/checkpoints/final.pt",
+            ]
+            for ckpt_path in ckpt_prioritized_paths:
+                if os.path.exists(ckpt_path):
+                    break
+            else:
+                raise FileNotFoundError(f"Pretrained model not found at {pretrained_name_or_path}")
+
+        if ckpt_path.endswith(".safetensors"):
+            state_dict = safe.load_file(ckpt_path, device=cfg.device)
+        else:
+            state_dict = torch.load(ckpt_path, map_location=cfg.device)["sae"]
+
+        
+
+        # if cfg.norm_activation == "dataset-wise":
+        #     state_dict = model.standardize_parameters_of_dataset_activation_scaling(state_dict)
+
+        # if cfg.sparsity_include_decoder_norm:
+        #     state_dict = model.transform_to_unit_decoder_norm(state_dict)
+
+        # if cfg.act_fn == "topk" and cfg.jump_relu_threshold > 0:
+        #     print("Converting topk activation to jumprelu for inference. Features are set independent to each other.")
+        #     model.cfg.act_fn = "jumprelu"
+        cfg.act_fn = "relu"
+
+        model = cls(cfg)
+
+        model.load_state_dict(state_dict, strict=cfg.strict_loading)
+
+        return model

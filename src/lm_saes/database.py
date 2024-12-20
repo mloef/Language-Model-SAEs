@@ -1,5 +1,6 @@
 from typing import Any, Mapping
 
+import os
 import gridfs
 import numpy as np
 import pymongo
@@ -11,7 +12,7 @@ from .utils.bytes import bytes_to_np, np_to_bytes
 
 class MongoClient:
     def __init__(self, mongo_uri: str, mongo_db: str):
-        self.client: pymongo.MongoClient = pymongo.MongoClient(mongo_uri)
+        self.client: pymongo.MongoClient = pymongo.MongoClient(mongo_uri, maxPoolSize=os.cpu_count())
         self.db = self.client[mongo_db]
         self.fs = gridfs.GridFS(self.db)
         self.feature_collection = self.db["features"]

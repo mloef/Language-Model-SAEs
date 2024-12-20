@@ -444,17 +444,18 @@ class CrossCoder(SparseAutoEncoder):
             state_dict = torch.load(ckpt_path, map_location=cfg.device)["sae"]
 
         
+        # TODO: Make this available for analysis
+        if cfg.norm_activation == "dataset-wise":
+            state_dict = model.standardize_parameters_of_dataset_activation_scaling(state_dict)
 
-        # if cfg.norm_activation == "dataset-wise":
-        #     state_dict = model.standardize_parameters_of_dataset_activation_scaling(state_dict)
+        if cfg.sparsity_include_decoder_norm:
+            state_dict = model.transform_to_unit_decoder_norm(state_dict)
 
-        # if cfg.sparsity_include_decoder_norm:
-        #     state_dict = model.transform_to_unit_decoder_norm(state_dict)
-
-        # if cfg.act_fn == "topk" and cfg.jump_relu_threshold > 0:
-        #     print("Converting topk activation to jumprelu for inference. Features are set independent to each other.")
-        #     model.cfg.act_fn = "jumprelu"
-        cfg.act_fn = "relu"
+        if cfg.act_fn == "topk" and cfg.jump_relu_threshold > 0:
+            print("Converting topk activation to jumprelu for inference. Features are set independent to each other.")
+            model.cfg.act_fn = "jumprelu"
+            
+        # model.cfg.act_fn = "relu"
 
         model = cls(cfg)
 

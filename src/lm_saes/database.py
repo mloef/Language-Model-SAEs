@@ -18,6 +18,7 @@ class MongoClient:
         self.feature_collection = self.db["features"]
         self.dictionary_collection = self.db["dictionaries"]
         self.attn_head_collection = self.db["attn_heads"]
+        self.dataset_collection = self.db["datasets"]
         self.dictionary_collection.create_index(
             [("name", pymongo.ASCENDING), ("series", pymongo.ASCENDING)], unique=True
         )
@@ -27,6 +28,7 @@ class MongoClient:
         self.attn_head_collection.create_index(
             [("dictionary_id", pymongo.ASCENDING), ("index", pymongo.ASCENDING)], unique=True
         )
+        self.dataset_collection.create_index([("name", pymongo.ASCENDING)], unique=True)
 
     def _to_gridfs(self, data: Any) -> Any:
         """
@@ -96,7 +98,6 @@ class MongoClient:
         self.feature_collection.update_one({"_id": feature["_id"]}, {"$set": self._to_gridfs(feature_data)})
 
     def list_dictionaries(self, dictionary_series: str | None = None) -> list[str]:
-        # return [{'name': d['name'], 'path': d['path']} for d in self.dictionary_collection.find({'series': dictionary_series} if dictionary_series is not None else {})]
         return [
             d["name"]
             for d in self.dictionary_collection.find(
@@ -114,6 +115,12 @@ class MongoClient:
             "series": dictionary["series"],
             "path": dictionary["path"] if "path" in dictionary else None,
         }
+
+    def get_dataset(self, dataset_name: str) -> dict[str, Any] | None:
+        dataset = self.dataset_collection.find_one({"name": dataset_name})
+        if dataset is None:
+            return None
+        return dataset
 
     def get_feature(
         self, dictionary_name: str, feature_index: int, dictionary_series: str | None = None

@@ -1,3 +1,4 @@
+import io
 import os
 from typing import Annotated, Any, Literal, Union, cast
 
@@ -6,14 +7,14 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_from_disk
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
+from torchvision import transforms
 from transformer_lens import HookedTransformer
 from transformer_lens.hook_points import HookPoint
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from lm_saes.analysis.auto_interp import check_description, generate_description
 from lm_saes.circuit.context import apply_sae, detach_at
@@ -21,6 +22,7 @@ from lm_saes.config import AutoInterpConfig, LanguageModelConfig, SAEConfig
 from lm_saes.database import MongoClient
 from lm_saes.sae import SparseAutoEncoder
 from lm_saes.utils.bytes import bytes_to_unicode
+from lm_saes.utils.model import load_model
 
 result_dir = os.environ.get("RESULT_DIR", "results")
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -48,26 +50,7 @@ def get_model(dictionary_name: str) -> HookedTransformer:
         path = f"{result_dir}/{dictionary_name}"
     cfg = LanguageModelConfig.from_pretrained_sae(path)
     if (cfg.model_name, cfg.model_from_pretrained_path) not in lm_cache:
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            (cfg.model_name if cfg.model_from_pretrained_path is None else cfg.model_from_pretrained_path),
-            cache_dir=cfg.cache_dir,
-            local_files_only=cfg.local_files_only,
-        )
-        tokenizer = AutoTokenizer.from_pretrained(
-            (cfg.model_name if cfg.model_from_pretrained_path is None else cfg.model_from_pretrained_path),
-            trust_remote_code=True,
-            use_fast=False,
-            add_bos_token=True,
-        )
-        model = HookedTransformer.from_pretrained_no_processing(
-            cfg.model_name,
-            device=device,
-            cache_dir=cfg.cache_dir,
-            hf_model=hf_model,
-            tokenizer=tokenizer,
-            dtype=hf_model.dtype,
-        )
-        model.eval()
+        model = load_model(cfg)
         lm_cache[(cfg.model_name, cfg.model_from_pretrained_path)] = model
     return lm_cache[(cfg.model_name, cfg.model_from_pretrained_path)]
 
@@ -83,8 +66,10 @@ def get_sae(dictionary_name: str) -> SparseAutoEncoder:
 
 
 def get_dataset(dataset_name: str) -> Dataset:
+    dataset = client.get_dataset(dataset_name)
+    assert dataset is not None, f"Dataset {dataset_name} not found"
     if dataset_name not in dataset_cache:
-        dataset_cache[dataset_name] = cast(Dataset, load_dataset(dataset_name))
+        dataset_cache[dataset_name] = cast(Dataset, load_from_disk(dataset["path"]).with_format("torch", device=device))
     return dataset_cache[dataset_name]
 
 
@@ -119,6 +104,29 @@ def list_dictionaries():
     return client.list_dictionaries(dictionary_series=dictionary_series)
 
 
+@app.get("/images/{dataset_name}/{context_idx}/{image_idx}")
+def get_image(dataset_name: str, context_idx: int, image_idx: int):
+    dataset = get_dataset(dataset_name)
+    data = dataset[int(context_idx)]
+
+    image_key = "image" if "image" in data else "images" if "images" in data else None
+    if image_key is None:
+        return Response(content="Image not found", status_code=404)
+
+    if len(data[image_key]) <= image_idx:
+        return Response(content="Image not found", status_code=404)
+
+    image_tensor = data[image_key][image_idx]
+
+    # Convert tensor to PIL Image and then to bytes
+    image = transforms.ToPILImage()(image_tensor.to(torch.uint8))
+    img_byte_arr = io.BytesIO()
+    image.save(img_byte_arr, format="PNG")
+    img_byte_arr = img_byte_arr.getvalue()
+
+    return Response(content=img_byte_arr, media_type="image/png")
+
+
 @app.get("/dictionaries/{dictionary_name}/features/{feature_index}")
 def get_feature(dictionary_name: str, feature_index: str | int):
     model = get_model(dictionary_name)
@@ -140,16 +148,25 @@ def get_feature(dictionary_name: str, feature_index: str | int):
             content=f"Feature {feature_index} not found in dictionary {dictionary_name}",
             status_code=404,
         )
-    dataset = get_dataset(feature["dataset"])
+    datasets = [get_dataset(dataset_name) for dataset_name in feature["dataset"]]
 
     sample_groups = []
     for analysis in feature["analysis"]:
         samples = []
         for i in range(len(analysis["feature_acts"])):
             feature_acts = analysis["feature_acts"][i]
-            context_id = analysis["context_ids"][i]
-            data = dataset[context_id]
+            context_id = analysis["context_ids"][i].item()
+            dataset_id = analysis["dataset_ids"][i].item()
+            data = datasets[dataset_id][context_id]
             _, token_origins = model.to_tokens_with_origins(data)
+
+            # Replace image_key with image_url
+            image_key = "image" if "image" in data else "images" if "images" in data else None
+            if image_key is not None:
+                image_urls = [f"/images/{feature['dataset'][i]}/{context_id}/{i}" for i in range(len(data[image_key]))]
+                del data[image_key]
+                data["images"] = image_urls
+
             samples.append(
                 {
                     **data,
@@ -165,15 +182,18 @@ def get_feature(dictionary_name: str, feature_index: str | int):
             }
         )
 
-    feature_activation_histogram = px.histogram(feature["feature_acts_all"], width=600, nbins=50)
+    if "feature_acts_all" in feature:
+        feature_activation_histogram = px.histogram(feature["feature_acts_all"], width=600, nbins=50)
 
-    feature_activation_histogram = go.Histogram(
-        x=feature["feature_acts_all"],
-        nbinsx=50,
-        hovertemplate="Count: %{y}<br>Range: %{x}<extra></extra>",
-        marker_color="#636EFA",
-        showlegend=False,
-    ).to_plotly_json()
+        feature_activation_histogram = go.Histogram(
+            x=feature["feature_acts_all"],
+            nbinsx=50,
+            hovertemplate="Count: %{y}<br>Range: %{x}<extra></extra>",
+            marker_color="#636EFA",
+            showlegend=False,
+        ).to_plotly_json()
+    else:
+        feature_activation_histogram = None
 
     if "logits" in feature:
         logits_bin_edges = np.array(feature["logits"]["histogram"]["edges"])
@@ -195,7 +215,9 @@ def get_feature(dictionary_name: str, feature_index: str | int):
                 {
                     "feature_index": feature["index"],
                     "dictionary_name": dictionary_name,
-                    "feature_activation_histogram": [feature_activation_histogram],
+                    "feature_activation_histogram": [feature_activation_histogram]
+                    if feature_activation_histogram is not None
+                    else None,
                     "act_times": feature["act_times"],
                     "max_feature_act": feature["max_feature_acts"],
                     "sample_groups": sample_groups,

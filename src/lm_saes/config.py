@@ -103,7 +103,7 @@ class TextDatasetConfig(RunnerConfig):
     cache_dir: Optional[str] = None
     is_dataset_tokenized: bool = False
     is_dataset_on_disk: bool = False
-    concat_tokens: List[bool] = False  # type: ignore
+    concat_tokens: List[bool] = field(default_factory=lambda: [False])  # type: ignore
     context_size: int = 128
     store_batch_size: int = 64
     sample_probs: List[float] = field(default_factory=lambda: [1.0])
@@ -148,8 +148,8 @@ class ActivationStoreConfig(BaseModelConfig, RunnerConfig):
     use_cached_activations: bool = False
     cached_activations_path: List[str] = None  # type: ignore
     shuffle_activations: bool = True
-    preload_queue_maxsize: int = 32
-
+    cache_sample_probs: List[float] = field(default_factory=lambda: [1.0])
+    ban_token_list: List[List[int]] = field(default_factory=lambda: [[]])
     n_tokens_in_buffer: int = 500_000
     tp_size: int = 1
     ddp_size: int = 1
@@ -162,6 +162,10 @@ class ActivationStoreConfig(BaseModelConfig, RunnerConfig):
                 f"activations/{path.split('/')[-1]}/{self.lm.model_name.replace('/', '_')}_{self.dataset.context_size}"
                 for path in self.dataset.dataset_path
             ]
+        if self.use_cached_activations:
+            assert len(self.cache_sample_probs) == len(
+                self.cached_activations_path
+            ), "Number of cache_sample_probs must match number of cached_activations_path"
 
 
 @dataclass(kw_only=True)

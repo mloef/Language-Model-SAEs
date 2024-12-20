@@ -4,23 +4,14 @@ from typing import cast
 
 import torch
 import wandb
-from datasets import Dataset, load_dataset, load_from_disk
-import torch.distributed as dist
 from torch.distributed.tensor import Replicate
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
     parallelize_module,
 )
-from transformer_lens import HookedTransformer
-from transformers import (
-    AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-    ChameleonForConditionalGeneration,
-    PreTrainedModel,
-)
-from concurrent.futures import ThreadPoolExecutor
+
+from lm_saes.activation.token_source import MappedTokenSource
 
 from .activation.activation_dataset import make_activation_dataset
 from .activation.activation_source import CachedActivationSource
@@ -30,7 +21,6 @@ from .analysis.sample_feature_activations import sample_feature_activations
 from .config import (
     ActivationGenerationConfig,
     FeaturesDecoderConfig,
-    LanguageModelConfig,
     LanguageModelCrossCoderTrainingConfig,
     LanguageModelSAEAnalysisConfig,
     LanguageModelSAEPruningConfig,
@@ -45,55 +35,7 @@ from .post_processing import post_process_topk_to_jumprelu_for_inference
 from .sae import SparseAutoEncoder
 from .sae_training import prune_sae, train_sae
 from .utils.misc import is_master
-
-
-def get_model(cfg: LanguageModelConfig):
-    if "chameleon" in cfg.model_name:
-        hf_model = ChameleonForConditionalGeneration.from_pretrained(
-            (cfg.model_name if cfg.model_from_pretrained_path is None else cfg.model_from_pretrained_path),
-            cache_dir=cfg.cache_dir,
-            local_files_only=cfg.local_files_only,
-            torch_dtype=cfg.dtype,
-        ).to(cfg.device)  # type: ignore
-        print(f"Model loaded on device {cfg.device}")
-    else:
-        hf_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-            (cfg.model_name if cfg.model_from_pretrained_path is None else cfg.model_from_pretrained_path),
-            cache_dir=cfg.cache_dir,
-            local_files_only=cfg.local_files_only,
-            torch_dtype=cfg.dtype,
-        ).to(cfg.device)  # type: ignore
-    if "chameleon" in cfg.model_name:
-        hf_processor = AutoProcessor.from_pretrained(
-            (cfg.model_name if cfg.model_from_pretrained_path is None else cfg.model_from_pretrained_path),
-            trust_remote_code=True,
-            use_fast=True,
-            add_bos_token=True,
-            local_files_only=True,
-        )
-        hf_tokenizer = None
-    else:
-        hf_tokenizer = AutoTokenizer.from_pretrained(
-            (cfg.model_name if cfg.model_from_pretrained_path is None else cfg.model_from_pretrained_path),
-            trust_remote_code=True,
-            use_fast=True,
-            add_bos_token=True,
-            local_files_only=True,
-        )
-        hf_processor = None
-
-    model = HookedTransformer.from_pretrained_no_processing(
-        cfg.model_name,
-        use_flash_attn=cfg.use_flash_attn,
-        device=cfg.device,
-        cache_dir=cfg.cache_dir,
-        hf_model=hf_model,
-        tokenizer=hf_tokenizer,
-        processor=hf_processor,
-        dtype=cfg.dtype,
-    )
-    model.eval()
-    return model
+from .utils.model import load_model
 
 def get_sae_class(cfg: SAEConfig):
     class_dict = {
@@ -109,7 +51,7 @@ def language_model_sae_runner(cfg: LanguageModelSAETrainingConfig):
         activation_store = ActivationStore(act_source=activation_source, cfg=cfg.act_store)
         model = None
     else:
-        model = get_model(cfg.lm)
+        model = load_model(cfg.lm)
         activation_store = ActivationStore.from_config(model=model, cfg=cfg.act_store)
 
     if not cfg.finetuning and (
@@ -226,7 +168,7 @@ def language_model_sae_prune_runner(cfg: LanguageModelSAEPruningConfig):
     cfg.sae.save_hyperparameters(os.path.join(cfg.exp_result_path))
     cfg.lm.save_lm_config(os.path.join(cfg.exp_result_path))
     sae = SparseAutoEncoder.from_config(cfg=cfg.sae)
-    model = get_model(cfg.lm)
+    model = load_model(cfg.lm)
     activation_store = ActivationStore.from_config(model=model, cfg=cfg.act_store)
     if cfg.wandb.log_to_wandb and is_master():
         wandb_config: dict = {
@@ -266,7 +208,7 @@ def language_model_sae_prune_runner(cfg: LanguageModelSAEPruningConfig):
 
 def language_model_sae_eval_runner(cfg: LanguageModelSAERunnerConfig):
     sae = SparseAutoEncoder.from_config(cfg=cfg.sae)
-    model = get_model(cfg.lm)
+    model = load_model(cfg.lm)
     activation_store = ActivationStore.from_config(model=model, cfg=cfg.act_store)
 
     if cfg.wandb.log_to_wandb and is_master():
@@ -302,7 +244,7 @@ def language_model_sae_eval_runner(cfg: LanguageModelSAERunnerConfig):
 
 
 def activation_generation_runner(cfg: ActivationGenerationConfig):
-    model = get_model(cfg.lm)
+    model = load_model(cfg.lm)
 
     make_activation_dataset(model, cfg)
 
@@ -320,8 +262,9 @@ def sample_feature_activations_runner(cfg: LanguageModelSAEAnalysisConfig):
             plan["encoder_glu"] = ColwiseParallel(output_layouts=Replicate())
         sae = cast(SaeClass, parallelize_module(sae, device_mesh=sae.device_mesh["tp"], parallelize_plan=plan))
 
-    sae.decoder.weight = None  # type: ignore[assignment]
-    torch.cuda.empty_cache()
+    # JumpReLU need SAE decoder weight, so we currently do not remove it
+    # sae.decoder.weight = None  # type: ignore[assignment]
+    # torch.cuda.empty_cache()
 
     if cfg.act_store.use_cached_activations:
         activation_source = CachedActivationSource(cfg.act_store)
@@ -363,52 +306,30 @@ def sample_feature_activations_runner(cfg: LanguageModelSAEAnalysisConfig):
     
         
 
-    def write_to_db(cfg, client, result, i):
-        client.update_feature(
-            cfg.exp_name,
-            result["index"][i].item(),
-            {
-                "act_times": result["act_times"][i].item(),
-                "max_feature_acts": result["max_feature_acts"][i].item(),
-                "dataset": cfg.dataset.dataset_path,
-                "analysis": [
-                    {
-                        "name": v["name"],
-                        "feature_acts": v["feature_acts"][i].cpu().float().numpy(),
-                        "context_ids": v["context_ids"][i].cpu().numpy(),
-                    }
-                    for v in result["analysis"]
-                ],
-            },
-            dictionary_series=cfg.exp_series,
-        )
-    
-    def parallel_write(cfg, client, result, max_workers):
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for i in range(len(result["index"].cpu().numpy().tolist())):
-                futures.append(
-                    executor.submit(
-                        write_to_db, cfg, client, result, i
-                    )
-                )
-        
-            # Optionally, wait for all tasks to complete
-            for future in futures:
-                future.result()
-
+    token_source = MappedTokenSource.from_config(model=model, cfg=cfg.dataset)
 
     for chunk_id in range(cfg.n_sae_chunks):
-        result = sample_feature_activations(
-            sae=sae, 
-            cfg=cfg, 
-            sae_chunk_id=chunk_id, 
-            n_sae_chunks=cfg.n_sae_chunks,
-            model=model, 
-            dataset=dataset,
-            activation_store=activation_store,
-            ignore_tokens=ignore_tokens
-        )
+        result = sample_feature_activations(sae, model, token_source, cfg, chunk_id, cfg.n_sae_chunks)
+        for i in range(len(result["index"].cpu().numpy().tolist())):
+            client.update_feature(
+                cfg.exp_name,
+                result["index"][i].item(),
+                {
+                    "act_times": result["act_times"][i].item(),
+                    "max_feature_acts": result["max_feature_acts"][i].item(),
+                    "dataset": cfg.dataset.dataset_path,
+                    "analysis": [
+                        {
+                            "name": v["name"],
+                            "feature_acts": v["feature_acts"][i].cpu().float().numpy(),
+                            "context_ids": v["context_ids"][i].cpu().numpy(),
+                            "dataset_ids": v["dataset_ids"][i].cpu().numpy(),
+                        }
+                        for v in result["analysis"]
+                    ],
+                },
+                dictionary_series=cfg.exp_series,
+            )
 
         if is_master():
             parallel_write(cfg, client, result, os.cpu_count())
@@ -421,7 +342,7 @@ def sample_feature_activations_runner(cfg: LanguageModelSAEAnalysisConfig):
 def features_to_logits_runner(cfg: FeaturesDecoderConfig):
     sae = SparseAutoEncoder.from_config(cfg=cfg.sae)
 
-    model = get_model(cfg.lm)
+    model = load_model(cfg.lm)
 
     result_dict = features_to_logits(sae, model, cfg)
 
@@ -464,7 +385,7 @@ def features_to_logits_runner(cfg: FeaturesDecoderConfig):
 @torch.no_grad()
 def post_process_topk_to_jumprelu_runner(cfg: LanguageModelSAERunnerConfig):
     sae = SparseAutoEncoder.from_config(cfg=cfg.sae)
-    model = get_model(cfg.lm)
+    model = load_model(cfg.lm)
 
     activation_store = ActivationStore.from_config(model=model, cfg=cfg.act_store)
     post_process_topk_to_jumprelu_for_inference(sae, activation_store, cfg)

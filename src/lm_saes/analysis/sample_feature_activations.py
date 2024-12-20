@@ -1,14 +1,17 @@
-from typing import Any, cast
+# TODO: check if this is compatible for both cc and chameleon @xuyang
+
+
+from typing import cast
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset
 from einops import rearrange, repeat
 from torch.distributed.tensor import DTensor
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformer_lens import HookedTransformer
 from functools import partial
+
+from lm_saes.activation.token_source import MappedTokenSource
 
 from ..config import LanguageModelSAEAnalysisConfig
 from ..sae import SparseAutoEncoder
@@ -63,6 +66,8 @@ def _generator_with_cached_store(
 @torch.no_grad()
 def sample_feature_activations(
     sae: SparseAutoEncoder,
+    model: HookedTransformer,
+    token_source: MappedTokenSource,
     cfg: LanguageModelSAEAnalysisConfig,
     sae_chunk_id: int = 0,
     n_sae_chunks: int = 1,  # By default, we do not chunk the SAE. When the model & SAE is large, we can chunk the SAE to save memory.
@@ -113,6 +118,11 @@ def sample_feature_activations(
                 device=cfg.sae.device,
             ),
             "context_ids": torch.empty(
+                (0, d_sae),
+                dtype=torch.int32,
+                device=cfg.sae.device,
+            ),
+            "dataset_ids": torch.empty(
                 (0, d_sae),
                 dtype=torch.int32,
                 device=cfg.sae.device,
@@ -187,10 +197,12 @@ def sample_feature_activations(
                         "batch_size context_size d_sae -> batch_size d_sae context_size",
                     ),
                     "context_ids": repeat(
-                        torch.arange(
-                            cfg.dataset.store_batch_size,
-                            device=cfg.sae.device
-                        ) + batch_idx * cfg.dataset.store_batch_size,
+                        torch.tensor([source.context_idx for source in sources], device=cfg.sae.device),
+                        "batch_size -> batch_size d_sae",
+                        d_sae=d_sae,
+                    ),
+                    "dataset_ids": repeat(
+                        torch.tensor([source.dataset_idx for source in sources], device=cfg.sae.device),
                         "batch_size -> batch_size d_sae",
                         d_sae=d_sae,
                     ),
@@ -208,9 +220,6 @@ def sample_feature_activations(
 
         pbar.update(num_tokens_per_batch)
 
-        if n_training_tokens >= total_analyzing_tokens:
-            break
-
     pbar.close()
 
     sample_result = {
@@ -227,6 +236,7 @@ def sample_feature_activations(
                 "name": k,
                 "feature_acts": v["feature_acts"],
                 "context_ids": v["context_ids"],
+                "dataset_ids": v["dataset_ids"],
             }
             for k, v in sample_result.items()
         ],

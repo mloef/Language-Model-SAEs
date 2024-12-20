@@ -4,12 +4,23 @@ from typing import cast
 
 import torch
 import wandb
+from datasets import Dataset, load_dataset, load_from_disk
+import torch.distributed as dist
 from torch.distributed.tensor import Replicate
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
     parallelize_module,
 )
+from transformer_lens import HookedTransformer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    ChameleonForConditionalGeneration,
+    PreTrainedModel,
+)
+from concurrent.futures import ThreadPoolExecutor
 
 from lm_saes.activation.token_source import MappedTokenSource
 
@@ -304,8 +315,6 @@ def sample_feature_activations_runner(cfg: LanguageModelSAEAnalysisConfig):
     if is_master():
         client.create_dictionary(cfg.exp_name, cfg.exp_result_path, cfg.sae.d_sae, cfg.exp_series)
     
-        
-
     token_source = MappedTokenSource.from_config(model=model, cfg=cfg.dataset)
 
     for chunk_id in range(cfg.n_sae_chunks):

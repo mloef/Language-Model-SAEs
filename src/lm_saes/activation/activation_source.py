@@ -78,10 +78,8 @@ class CachedActivationSource(ActivationSource):
     def __init__(self, cfg: ActivationStoreConfig):
         self.cfg = cfg
         self.sample_probs = cfg.cache_sample_probs
-        # assert cfg.use_cached_activations and len(cfg.cached_activations_path) == 1
+
         assert cfg.use_cached_activations
-        # assert len(cfg.hook_points) == 1, "CachedActivationSource only supports one hook point"
-        # show warning if there are more than one hook hook_points
         if len(cfg.hook_points) > 1:
             print(
                 "CachedActivationSource only supports one hook point, but %d hook points are provided. Only the first hook point will be used.",
@@ -94,9 +92,6 @@ class CachedActivationSource(ActivationSource):
         ]
         self.chunk_buffer = {}  # n_tokens_in_buffer
         if cfg.ddp_size > 1:
-            # self.chunk_paths = [
-            #     p for i, p in enumerate(self.chunk_paths) if i % dist.get_world_size() == dist.get_rank()
-            # ]
             self.chunk_paths = [
                 [p for i, p in enumerate(chunk_paths) if i % dist.get_world_size() == dist.get_rank()]
                 for chunk_paths in self.chunk_paths
@@ -106,26 +101,6 @@ class CachedActivationSource(ActivationSource):
                 random.shuffle(self.chunk_paths[num])
 
         self.token_buffer = torch.empty((0, cfg.dataset.context_size), dtype=torch.long, device=cfg.device)
-    
-    # def _preload_chunks(self):
-    #     while not self.stop_preloader and len(self.chunk_paths) > 0:
-    #         if not self.chunk_queue.full():
-    #             chunk_path = self.chunk_paths.pop()
-    #             chunk = load_activation_chunk(chunk_path, map_location='cpu')
-    #             self.chunk_queue.put(chunk)
-
-    # def _load_next_chunk(self):
-    #     if sum(self.sample_probs) == 0:
-    #         return None
-    #     # get one chunk from sample_probs
-    #     chunk_id = random.choices(range(len(self.chunk_paths)), weights=self.sample_probs)[0]
-    #     chunk_path = self.chunk_paths[chunk_id].pop()
-    #     # print(chunk_path)
-    #     if len(self.chunk_paths[chunk_id]) == 0:
-    #         self.sample_probs[chunk_id] = 0
-    #         self.sample_probs = [p / sum(self.sample_probs) for p in self.sample_probs]
-    #     chunk = load_activation_chunk(chunk_path, self.cfg.device)
-    #     return chunk
 
     def load_chunk_into_buffer(self, dataset_id, chunk_path: list[str], ban_token_list=None):
         if dataset_id not in self.chunk_buffer:
@@ -168,21 +143,6 @@ class CachedActivationSource(ActivationSource):
             )
         }
         return ret
-
-    # def next(self) -> Dict[str, torch.Tensor] | None:
-    #     chunk = self._load_next_chunk()
-    #     if chunk is None:
-    #         return None
-    #     assert len(chunk["activation"].size()) in [
-    #         2,
-    #         3,
-    #     ], "activation size must be 2-dim (no context) or 3-dim (with context stored in batches)"
-    #     with_context = len(chunk["activation"].size()) == 3
-
-    #     activations = chunk["activation"].to(dtype=self.cfg.dtype, device=self.cfg.device)
-
-    #     ret = {self.hook_point: rearrange(activations, "b l d -> (b l) d") if with_context else activations}
-    #     return ret
 
     def next_tokens(self, batch_size: int) -> torch.Tensor | None:
         if self.token_buffer.size(0) < batch_size:

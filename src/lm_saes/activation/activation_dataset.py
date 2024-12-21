@@ -171,7 +171,7 @@ def make_activation_dataset(model: HookedTransformer, cfg: ActivationGenerationC
             act_dict, 
             context, 
             chunk_idx,
-            max_workers=32
+            max_workers=os.cpu_count(),
         )
         # for hook_point in cfg.hook_points:
         #     result = {"activation": act_dict[hook_point]}

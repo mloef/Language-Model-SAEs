@@ -281,7 +281,7 @@ def sample_feature_activations_runner(cfg: LanguageModelSAEAnalysisConfig):
         activation_source = CachedActivationSource(cfg.act_store)
         activation_store = ActivationStore(act_source=activation_source, cfg=cfg.act_store)
         model = None
-        dataset = None
+        token_source = None
         hf_tokenizer = AutoTokenizer.from_pretrained(
             (cfg.lm.model_name if cfg.lm.model_from_pretrained_path is None else cfg.lm.model_from_pretrained_path),
             trust_remote_code=True,
@@ -294,16 +294,8 @@ def sample_feature_activations_runner(cfg: LanguageModelSAEAnalysisConfig):
             hf_tokenizer.eos_token_id,
         }
     else:
-        model = get_model(cfg.lm)
-        assert len(cfg.dataset.dataset_path) == 1, "Only one dataset path is supported"
-        if not cfg.dataset.is_dataset_on_disk:
-            dataset = load_dataset(
-                cfg.dataset.dataset_path[0], split="train", cache_dir=cfg.dataset.cache_dir, keep_in_memory=True
-            )
-        else:
-            dataset = load_from_disk(cfg.dataset.dataset_path[0], keep_in_memory=True)
-        dataset = cast(Dataset, dataset)
-        dataset = dataset.with_format("torch", device=cfg.lm.device)
+        model = load_model(cfg.lm)
+        token_source = MappedTokenSource.from_config(model=model, cfg=cfg.dataset)
         activation_store = None
         ignore_tokens = {
             model.tokenizer.bos_token_id,
@@ -315,10 +307,17 @@ def sample_feature_activations_runner(cfg: LanguageModelSAEAnalysisConfig):
     if is_master():
         client.create_dictionary(cfg.exp_name, cfg.exp_result_path, cfg.sae.d_sae, cfg.exp_series)
     
-    token_source = MappedTokenSource.from_config(model=model, cfg=cfg.dataset)
-
     for chunk_id in range(cfg.n_sae_chunks):
-        result = sample_feature_activations(sae, model, token_source, cfg, chunk_id, cfg.n_sae_chunks)
+        result = sample_feature_activations(
+            sae=sae, 
+            model=model, 
+            token_source=token_source,
+            activation_store=activation_store,
+            cfg=cfg, 
+            sae_chunk_id=chunk_id, 
+            n_sae_chunks=cfg.n_sae_chunks
+        )
+
         for i in range(len(result["index"].cpu().numpy().tolist())):
             client.update_feature(
                 cfg.exp_name,

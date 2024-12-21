@@ -1,6 +1,7 @@
 import random
 from abc import ABC
-from typing import Dict
+from typing import Dict, NamedTuple
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -12,6 +13,41 @@ import queue
 from ..config import ActivationStoreConfig
 from .token_source import TokenSource
 from .utils import list_activation_chunks, load_activation_chunk
+
+
+class ActivationSourceInfo(NamedTuple):
+    dataset_idx: int
+    context_idx: int
+
+
+@dataclass
+class ActivationBatch:
+    context: torch.Tensor
+    sources: ActivationSourceInfo
+    activations: torch.Tensor
+
+    def __len__(self):
+        return len(self.context)
+    
+    def fetch_a_batch(self, batch_size: int):
+        result = ActivationBatch(
+            context=self.context[:batch_size],
+            sources=self.sources[:batch_size],
+            activations=self.activations[:batch_size],
+        )
+        residual = ActivationBatch(
+            context=self.context[batch_size:],
+            sources=self.sources[batch_size:],
+            activations=self.activations[batch_size:],
+        )
+        return result, residual
+    
+    def merge_buffer(self, buffer: ActivationBatch):
+        self.context = torch.cat([self.context, buffer.context], dim=0)
+        self.sources = self.sources + buffer.sources
+        self.activations = torch.cat([self.activations, buffer.activations], dim=0)
+
+        return self
 
 
 class ActivationSource(ABC):
@@ -107,13 +143,13 @@ class CachedActivationSource(ActivationSource):
             self.chunk_buffer[dataset_id] = torch.empty(
                 (0, self.cfg.lm.d_model), dtype=self.cfg.dtype, device=self.cfg.device
             )
-        to_fill_length = self.cfg.n_tokens_in_buffer // len(self.chunk_paths) - self.chunk_buffer[dataset_id].size(0)
+        to_fill_length = self.cfg.n_tokens_in_buffer // len(self.chunk_paths) - self.chunk_buffer[dataset_id].size(0)  # Why // len(self.chunk_paths)
         while to_fill_length > 0 and len(chunk_path) > 0:
             chunk = load_activation_chunk(chunk_path.pop(), self.cfg.device)
             with_context = len(chunk["activation"].size()) == 3
             activation = chunk["activation"]
             if with_context:
-                chunk["context"] = chunk["context"].to(dtype=torch.long, device=self.cfg.device)
+                chunk["context"] = chunk["context"].to(dtype=torch.long, device=self.cfg.device, non_blocking=True)
                 not_ban_token = torch.isin(
                     rearrange(chunk["context"], "b l -> (b l)"),
                     torch.tensor(ban_token_list, device=self.cfg.device),
@@ -139,7 +175,11 @@ class CachedActivationSource(ActivationSource):
 
         ret = {
             self.hook_point: torch.cat(
-                [self.chunk_buffer[i][: next_length_list[i]] for i in range(len(self.chunk_paths))], dim=0
+                [
+                    self.chunk_buffer[i][: next_length_list[i]] 
+                    for i in range(len(self.chunk_paths))
+                ],
+                dim=0
             )
         }
         return ret
@@ -152,4 +192,99 @@ class CachedActivationSource(ActivationSource):
             self.token_buffer = torch.cat([self.token_buffer, chunk["context"]], dim=0)
         ret = self.token_buffer[:batch_size]
         self.token_buffer = self.token_buffer[batch_size:]
+        return ret
+
+
+class MappedActivationSource(ActivationSource):
+    def __init__(self, cfg: ActivationStoreConfig):
+        self.cfg = cfg
+        self.sample_probs = cfg.cache_sample_probs
+
+        assert cfg.use_cached_activations
+
+        if len(cfg.hook_points) > 1:
+            print(
+                "CachedActivationSource only supports one hook point, but %d hook points are provided. Only the first hook point will be used.",
+                len(cfg.hook_points),
+            )
+
+        self.hook_point = cfg.hook_points[0]
+        self.chunk_paths: list[list[str]] = [
+            list_activation_chunks(cached_activations_path, self.hook_point)
+            for cached_activations_path in cfg.cached_activations_path
+        ]
+        self.chunk_buffer = {}  # n_tokens_in_buffer
+        if cfg.ddp_size > 1:
+            raise NotImplementedError('Not implemented')
+        if cfg.shuffle_activations:
+            raise ValueError('`shuffle_activations` is not recommended for MappedActivationSource in analysis')
+
+        self.token_buffer = torch.empty((0, cfg.dataset.context_size), dtype=torch.long, device=cfg.device)
+    
+    def load_chunk_into_buffer(self, dataset_id, chunk_path: list[str], ban_token_list=None):
+        if dataset_id not in self.chunk_buffer:
+            self.chunk_buffer[dataset_id] = ActivationBatch(
+                tokens=torch.empty(
+                    (0, self.cfg.dataset.context_size), 
+                    dtype=self.cfg.dtype, 
+                    device=self.cfg.device,
+                ),
+                sources=list(),
+                activations=torch.empty(
+                    (0, self.cfg.dataset.context_size, self.cfg.lm.d_model), 
+                    dtype=self.cfg.dtype, 
+                    device=self.cfg.device,
+                ),
+            )
+        to_fill_length = self.cfg.n_tokens_in_buffer // len(self.chunk_paths) - self.chunk_buffer[dataset_id].size(0)
+        while to_fill_length > 0 and len(chunk_path) > 0:
+            chunk = load_activation_chunk(chunk_path.pop(), self.cfg.device)
+            with_context = len(chunk["activation"].size()) == 3
+            if not with_context:
+                raise ValueError(
+                    f'The shape of saved activation is advised to be `(chunk_size, seq_len, d_model)`, got `{chunk["activation"].size()}`'
+                )
+            activation = chunk["activation"].to(dtype=torch.long, device=self.cfg.device, non_blocking=True)
+            context = chunk["context"].to(dtype=torch.long, device=self.cfg.device, non_blocking=True)
+            source_info = [
+                ActivationSourceInfo(
+                    dataset_idx=dataset_id
+                    context_idx=chunk["context_idx"][i].item()
+                )
+                for i in range(activation.size(0))
+            ]
+
+            self.chunk_buffer[dataset_id].merge_buffer(
+                ActivationBatch(
+                    context=context,
+                    sources=source_info,
+                    activations=activation,
+                ),
+            )
+            to_fill_length -= activation.size(0)
+        return chunk_path
+    
+    def next(self) -> Dict[str, torch.Tensor] | None:
+        for i, chunk_paths in enumerate(self.chunk_paths):
+            self.sample_probs[i] = 0 if len(chunk_paths) == 0 else self.sample_probs[i]
+        self.sample_probs = [p / sum(self.sample_probs) for p in self.sample_probs]
+
+        for i, chunk_paths in enumerate(self.chunk_paths):
+            self.chunk_paths[i] = self.load_chunk_into_buffer(i, chunk_paths, self.cfg.ban_token_list[i])
+
+        next_length_list = [
+            min(int(self.sample_probs[i] * self.cfg.n_tokens_in_buffer), self.chunk_buffer[i].size(0))
+            for i in range(len(self.chunk_paths))
+        ]
+
+        ret = {
+            self.hook_point: torch.cat(
+                [
+                    self.chunk_buffer[i][: next_length_list[i]] 
+                    for i in range(len(self.chunk_paths))
+                ],
+                dim=0
+            ),
+            'context': 
+        }
         return ret

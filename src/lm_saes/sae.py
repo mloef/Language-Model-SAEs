@@ -153,8 +153,8 @@ class SparseAutoEncoder(HookedRootModule):
             ), "dataset_average_activation_norm must be provided from Initializer"
             return torch.tensor(
                 math.sqrt(self.cfg.d_model) / self.dataset_average_activation_norm[hook_point],
-                device=x.device,
-                dtype=x.dtype,
+                device='cuda:0',
+                dtype=torch.bfloat16,  # x.dtype,
             )
         if self.cfg.norm_activation == "inference":
             return torch.tensor(1.0, device=x.device, dtype=x.dtype)

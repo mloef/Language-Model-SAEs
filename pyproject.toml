@@ -31,7 +31,7 @@ dependencies = [
     "torchvision>=0.20.1",
     "pydantic-settings>=2.7.1",
 ]
-requires-python = "==3.12.*"
+requires-python = "==3.10.*"
 readme = "README.md"
 
 [[project.authors]]

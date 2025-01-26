@@ -77,7 +77,7 @@ class BaseSAEConfig(BaseModelConfig):
             **kwargs: Additional keyword arguments to pass to the SAEConfig constructor.
         """
         path = parse_pretrained_name_or_path(pretrained_name_or_path)
-        with open(os.path.join(path, "config.json"), "r") as f:
+        with open(os.path.join(path, "hyperparams.json"), "r") as f:
             sae_config = json.load(f)
         sae_config["sae_pretrained_name_or_path"] = pretrained_name_or_path
         sae_config["strict_loading"] = strict_loading
@@ -90,7 +90,7 @@ class BaseSAEConfig(BaseModelConfig):
             d.pop("sae_pretrained_name_or_path", None)
             d.pop("strict_loading", None)
 
-        with open(os.path.join(sae_path, "config.json"), "w") as f:
+        with open(os.path.join(sae_path, "hyperparams.json"), "w") as f:
             json.dump(d, f, indent=4)
 
 
